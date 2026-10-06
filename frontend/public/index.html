@@ -55,12 +55,6 @@
         <div class="connect-btn-container">
             <button id="connect-btn">Connect</button>
         </div>
-        <div id="interface-selector-container" class="interface-selector-container" hidden>
-            <label for="interface-select">Interface</label>
-            <select id="interface-select">
-                <option value="standard">Standard A2A</option>
-            </select>
-        </div>
         <div id="agent-card-section">
             <h2 class="collapsible-header">
                 <span class="toggle-icon">▼</span> Agent Card
@@ -125,7 +119,7 @@
                     <button id="add-metadata-btn">+ Add Metadata</button>
                 </div>
             </div>
-            <div id="standard-message-input" class="chat-input-wrapper">
+            <div class="chat-input-wrapper">
                 <div id="attachments-preview" class="attachments-preview"></div>
                 <div class="chat-input-container">
                     <input type="file" id="file-input" class="file-input-hidden" multiple accept="*/*">
@@ -134,11 +128,6 @@
                         <span class="attach-icon">📎</span>
                     </button>
                     <button id="send-btn" disabled>Send</button>
-                </div>
-                <div id="websocket-frame-input" class="websocket-frame-input" hidden>
-                    <label for="websocket-frame">WebSocket frame</label>
-                    <textarea id="websocket-frame" rows="4" placeholder="Enter an exact text frame declared by the selected interface." disabled></textarea>
-                    <button id="send-websocket-frame-btn" disabled>Send Frame</button>
                 </div>
             </div>
         </div>

@@ -1,9 +1,6 @@
-import asyncio
 import base64
 import logging
 
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
@@ -11,15 +8,7 @@ from uuid import uuid4
 import bleach
 import httpx
 import socketio
-
-from websockets.asyncio.client import ClientConnection, connect
-from websockets.exceptions import ConnectionClosed
-
-
-try:
-    from backend import validators
-except ModuleNotFoundError:
-    import validators
+import validators
 
 from a2a.client import A2ACardResolver
 from a2a.client.client import Client, ClientConfig
@@ -93,11 +82,8 @@ sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 socket_app = socketio.ASGIApp(sio)
 app.mount('/socket.io', socket_app)
 
-frontend_public_dir = (
-    Path(__file__).resolve().parent.parent / 'frontend' / 'public'
-)
-app.mount('/static', StaticFiles(directory=frontend_public_dir), name='static')
-templates = Jinja2Templates(directory=frontend_public_dir)
+app.mount('/static', StaticFiles(directory='../frontend/public'), name='static')
+templates = Jinja2Templates(directory='../frontend/public')
 
 # ==============================================================================
 # State Management
@@ -107,27 +93,6 @@ templates = Jinja2Templates(directory=frontend_public_dir)
 # transient connections, this is acceptable. For a scalable production service,
 # a more robust state management solution (e.g., Redis) would be required.
 clients: dict[str, tuple[httpx.AsyncClient, Client, AgentCard, str]] = {}
-
-
-@dataclass(frozen=True)
-class InspectorWebSocketInterface:
-    """A versioned, explicitly declared Inspector WebSocket interface."""
-
-    index: int
-    url: str
-    protocol_binding: str
-    subprotocol: str
-
-
-@dataclass
-class WebSocketBridge:
-    """One remote connection and the task that relays its inbound frames."""
-
-    connection: ClientConnection
-    receive_task: asyncio.Task[None]
-
-
-websocket_bridges: dict[str, WebSocketBridge] = {}
 
 
 # ==============================================================================
@@ -199,120 +164,6 @@ def _get_output_modes(card: AgentCard) -> list[str]:
         if modes:
             return modes
     return ['text/plain']
-
-
-def _declared_inspector_websocket_interfaces(
-    card_data: dict[str, Any],
-) -> list[InspectorWebSocketInterface]:
-    """Return only complete Inspector-profile WebSocket declarations.
-
-    The card owns the endpoint and subprotocol. A custom protocol binding is a
-    label only; this function deliberately does not assign it any semantics.
-    """
-    interfaces = card_data.get('supportedInterfaces')
-    if not isinstance(interfaces, list):
-        return []
-
-    declarations: list[InspectorWebSocketInterface] = []
-    for index, interface in enumerate(interfaces):
-        if not isinstance(interface, dict):
-            continue
-
-        extensions = interface.get('extensions')
-        profile = (
-            extensions.get('a2aInspector')
-            if isinstance(extensions, dict)
-            else None
-        )
-        if not isinstance(profile, dict):
-            continue
-
-        url = interface.get('url')
-        protocol_binding = interface.get('protocolBinding')
-        profile_version = profile.get('profileVersion')
-        transport = profile.get('transport')
-        subprotocol = profile.get('subprotocol')
-        parsed_url = urlparse(url) if isinstance(url, str) else None
-
-        if (
-            not isinstance(url, str)
-            or parsed_url is None
-            or parsed_url.scheme not in {'ws', 'wss'}
-            or not parsed_url.netloc
-            or not isinstance(protocol_binding, str)
-            or not isinstance(profile_version, int)
-            or profile_version != 1
-            or transport != 'websocket'
-            or not isinstance(subprotocol, str)
-            or not subprotocol
-        ):
-            continue
-
-        declarations.append(
-            InspectorWebSocketInterface(
-                index=index,
-                url=url,
-                protocol_binding=protocol_binding,
-                subprotocol=subprotocol,
-            )
-        )
-
-    return declarations
-
-
-async def _fetch_agent_card_data(
-    client: httpx.AsyncClient, agent_card_url: str
-) -> dict[str, Any]:
-    """Fetch the unmodified Agent Card JSON so extension data is retained."""
-    response = await client.get(agent_card_url)
-    response.raise_for_status()
-    card_data = response.json()
-    if not isinstance(card_data, dict):
-        raise ValueError('Agent Card response must be a JSON object.')
-    return card_data
-
-
-async def _close_websocket_bridge(sid: str) -> None:
-    bridge = websocket_bridges.pop(sid, None)
-    if bridge is None:
-        return
-    bridge.receive_task.cancel()
-    await asyncio.gather(bridge.receive_task, return_exceptions=True)
-    await bridge.connection.close()
-
-
-async def _relay_websocket_frames(
-    sid: str, connection: ClientConnection
-) -> None:
-    """Relay opaque remote frames without interpreting a binding's protocol."""
-    try:
-        async for frame in connection:
-            if isinstance(frame, bytes):
-                payload = {
-                    'type': 'binary',
-                    'data': base64.b64encode(frame).decode('ascii'),
-                }
-            else:
-                payload = {'type': 'text', 'data': frame}
-            await _emit_debug_log(sid, str(uuid4()), 'response', payload)
-            await sio.emit('websocket_frame', payload, to=sid)
-    except ConnectionClosed as error:
-        await sio.emit(
-            'websocket_bridge_closed',
-            {'message': f'{error.code}: {error.reason}'},
-            to=sid,
-        )
-    except asyncio.CancelledError:
-        raise
-    except Exception as error:
-        logger.error('WebSocket bridge failed for sid %s', sid, exc_info=True)
-        await sio.emit(
-            'websocket_bridge_closed', {'message': str(error)}, to=sid
-        )
-    finally:
-        bridge = websocket_bridges.get(sid)
-        if bridge is not None and bridge.connection is connection:
-            websocket_bridges.pop(sid, None)
 
 
 # ==============================================================================
@@ -659,7 +510,10 @@ async def get_agent_card(request: Request) -> JSONResponse:
         async with httpx.AsyncClient(
             timeout=30.0, headers=custom_headers
         ) as client:
-            card_data = await _fetch_agent_card_data(client, agent_url)
+            card_resolver = get_card_resolver(client, agent_url)
+            card = await card_resolver.get_agent_card()
+
+        card_data = _get_agent_card_dict(card)
         validation_errors = validators.validate_agent_card(card_data)
         response_data = {
             'card': card_data,
@@ -707,7 +561,6 @@ async def handle_disconnect(sid: str) -> None:
         httpx_client, _, _, _ = clients.pop(sid)
         await httpx_client.aclose()
         logger.info(f'Cleaned up client for {sid}')
-    await _close_websocket_bridge(sid)
 
 
 @sio.on('initialize_client')
@@ -727,10 +580,6 @@ async def handle_initialize_client(sid: str, data: dict[str, Any]) -> None:
 
     httpx_client = None
     try:
-        await _close_websocket_bridge(sid)
-        existing_client = clients.pop(sid, None)
-        if existing_client is not None:
-            await existing_client[0].aclose()
         httpx_client = httpx.AsyncClient(timeout=600.0, headers=custom_headers)
         card_resolver = get_card_resolver(httpx_client, agent_card_url)
         card = await card_resolver.get_agent_card()
@@ -766,132 +615,6 @@ async def handle_initialize_client(sid: str, data: dict[str, Any]) -> None:
             await httpx_client.aclose()
         await sio.emit(
             'client_initialized', {'status': 'error', 'message': str(e)}, to=sid
-        )
-
-
-@sio.on('initialize_websocket_bridge')
-async def handle_initialize_websocket_bridge(
-    sid: str, data: dict[str, Any]
-) -> None:
-    """Connect to a selected, card-declared Inspector WebSocket interface."""
-    agent_card_url = data.get('url')
-    custom_headers = data.get('customHeaders', {})
-    interface_index = data.get('interfaceIndex')
-
-    if (
-        not isinstance(agent_card_url, str)
-        or not isinstance(custom_headers, dict)
-        or not isinstance(interface_index, int)
-    ):
-        await sio.emit(
-            'websocket_bridge_initialized',
-            {
-                'status': 'error',
-                'message': 'Agent URL, interface index, and headers are required.',
-            },
-            to=sid,
-        )
-        return
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=30.0, headers=custom_headers
-        ) as client:
-            card_data = await _fetch_agent_card_data(client, agent_card_url)
-        declaration = next(
-            (
-                item
-                for item in _declared_inspector_websocket_interfaces(card_data)
-                if item.index == interface_index
-            ),
-            None,
-        )
-        if declaration is None:
-            raise ValueError(
-                'The selected interface is not a complete declared '
-                'a2aInspector WebSocket profile.'
-            )
-
-        await _close_websocket_bridge(sid)
-        connection = await connect(
-            declaration.url,
-            subprotocols=[declaration.subprotocol],
-            additional_headers=custom_headers,
-        )
-        if connection.subprotocol != declaration.subprotocol:
-            await connection.close()
-            raise ValueError(
-                'Agent did not accept the declared WebSocket subprotocol.'
-            )
-
-        receive_task = asyncio.create_task(
-            _relay_websocket_frames(sid, connection)
-        )
-        websocket_bridges[sid] = WebSocketBridge(connection, receive_task)
-        await sio.emit(
-            'websocket_bridge_initialized',
-            {
-                'status': 'success',
-                'transport': declaration.protocol_binding,
-            },
-            to=sid,
-        )
-    except Exception as error:
-        logger.error(
-            'Failed to initialize WebSocket bridge for %s', sid, exc_info=True
-        )
-        await sio.emit(
-            'websocket_bridge_initialized',
-            {'status': 'error', 'message': str(error)},
-            to=sid,
-        )
-
-
-@sio.on('send_websocket_frame')
-async def handle_send_websocket_frame(sid: str, data: dict[str, Any]) -> None:
-    """Relay an explicit text or base64 binary browser frame unchanged."""
-    bridge = websocket_bridges.get(sid)
-    frame = data.get('frame') if isinstance(data, dict) else None
-    if bridge is None:
-        await sio.emit(
-            'websocket_bridge_closed',
-            {'message': 'WebSocket bridge is not connected.'},
-            to=sid,
-        )
-        return
-
-    try:
-        if isinstance(frame, str):
-            payload: str | bytes = frame
-            log_payload = {'type': 'text', 'data': frame}
-        elif (
-            isinstance(frame, dict)
-            and frame.get('type') == 'text'
-            and isinstance(frame.get('data'), str)
-        ):
-            payload = frame['data']
-            log_payload = {'type': 'text', 'data': payload}
-        elif (
-            isinstance(frame, dict)
-            and frame.get('type') == 'binary'
-            and isinstance(frame.get('data'), str)
-        ):
-            payload = base64.b64decode(frame['data'], validate=True)
-            log_payload = {'type': 'binary', 'data': frame['data']}
-        else:
-            raise ValueError(
-                'Frame must be text or an explicitly base64-encoded binary frame.'
-            )
-
-        event_id = str(uuid4())
-        await _emit_debug_log(sid, event_id, 'request', log_payload)
-        await bridge.connection.send(payload)
-    except Exception as error:
-        logger.error(
-            'Failed to relay WebSocket frame for %s', sid, exc_info=True
-        )
-        await sio.emit(
-            'websocket_bridge_closed', {'message': str(error)}, to=sid
         )
 
 

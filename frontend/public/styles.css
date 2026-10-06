@@ -301,19 +301,6 @@ body.dark-mode input:checked + .slider {
     margin-bottom: 60px;
 }
 
-.interface-selector-container,
-.websocket-frame-input {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    margin: 12px 0;
-}
-
-.websocket-frame-input textarea {
-    font-family: monospace;
-    resize: vertical;
-}
-
 .connect-btn-container {
     display: flex;
     justify-content: flex-end;
