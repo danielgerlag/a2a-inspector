@@ -1,6 +1,10 @@
 import {io} from 'socket.io-client';
 import {marked} from 'marked';
 import DOMPurify from 'dompurify';
+import {
+  discoverInspectorWebSocketInterfaces,
+  InspectorWebSocketInterface,
+} from './inspector-profile';
 
 // ==============================================================================
 // A2A Protocol v0.3 + v1.0 Type Definitions
@@ -231,6 +235,24 @@ document.addEventListener('DOMContentLoaded', () => {
   const attachmentsPreview = document.getElementById(
     'attachments-preview',
   ) as HTMLElement;
+  const interfaceSelectorContainer = document.getElementById(
+    'interface-selector-container',
+  ) as HTMLElement;
+  const interfaceSelect = document.getElementById(
+    'interface-select',
+  ) as HTMLSelectElement;
+  const standardMessageInput = document.getElementById(
+    'standard-message-input',
+  ) as HTMLElement;
+  const websocketFrameInput = document.getElementById(
+    'websocket-frame-input',
+  ) as HTMLElement;
+  const websocketFrame = document.getElementById(
+    'websocket-frame',
+  ) as HTMLTextAreaElement;
+  const sendWebsocketFrameBtn = document.getElementById(
+    'send-websocket-frame-btn',
+  ) as HTMLButtonElement;
 
   let contextId: string | null = null;
   let isConnected = false;
@@ -243,6 +265,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const logIdQueue: string[] = [];
   let initializationTimeout: ReturnType<typeof setTimeout>;
   let isProcessingLogQueue = false;
+  let inspectorInterfaces: InspectorWebSocketInterface[] = [];
+  let selectedInspectorInterface: InspectorWebSocketInterface | null = null;
+  let currentAgentCardUrl = '';
 
   // Attachment state
   interface Attachment {
@@ -773,6 +798,7 @@ document.addEventListener('DOMContentLoaded', () => {
     sendBtn.disabled = true;
 
     const customHeaders = getCustomHeaders();
+    currentAgentCardUrl = agentCardUrl;
     const requestHeaders = {
       'Content-Type': 'application/json',
       ...customHeaders,
@@ -790,6 +816,21 @@ document.addEventListener('DOMContentLoaded', () => {
       }
 
       agentCardCodeContent.textContent = JSON.stringify(data.card, null, 2);
+      inspectorInterfaces = discoverInspectorWebSocketInterfaces(data.card);
+      selectedInspectorInterface = null;
+      interfaceSelect.replaceChildren();
+      const standardOption = new Option('Standard A2A', 'standard');
+      interfaceSelect.add(standardOption);
+      inspectorInterfaces.forEach(profile => {
+        interfaceSelect.add(
+          new Option(
+            `${profile.protocolBinding} (${profile.subprotocol})`,
+            String(profile.index),
+          ),
+        );
+      });
+      interfaceSelect.value = 'standard';
+      interfaceSelectorContainer.hidden = inspectorInterfaces.length === 0;
       if (window.hljs) {
         window.hljs.highlightElement(agentCardCodeContent);
       } else {
@@ -811,6 +852,38 @@ document.addEventListener('DOMContentLoaded', () => {
         customHeaders: customHeaders,
       });
 
+      interfaceSelect.onchange = () => {
+        const selected = interfaceSelect.value;
+        if (selected === 'standard') {
+          selectedInspectorInterface = null;
+          standardMessageInput.hidden = false;
+          websocketFrameInput.hidden = true;
+          socket.emit('initialize_client', {
+            url: currentAgentCardUrl,
+            customHeaders: getCustomHeaders(),
+          });
+          return;
+        }
+
+        const profile = inspectorInterfaces.find(
+          candidate => candidate.index === Number(selected),
+        );
+        if (!profile) {
+          return;
+        }
+
+        selectedInspectorInterface = profile;
+        standardMessageInput.hidden = true;
+        websocketFrameInput.hidden = false;
+        websocketFrame.disabled = true;
+        sendWebsocketFrameBtn.disabled = true;
+        socket.emit('initialize_websocket_bridge', {
+          url: currentAgentCardUrl,
+          customHeaders: getCustomHeaders(),
+          interfaceIndex: profile.index,
+        });
+      };
+
       if (data.validation_errors.length > 0) {
         validationErrorsContainer.innerHTML = `<h3>Validation Errors</h3><ul>${data.validation_errors.map((e: string) => `<li>${e}</li>`).join('')}</ul>`;
       } else {
@@ -825,6 +898,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
+  socket.off('websocket_bridge_initialized');
   socket.on(
     'client_initialized',
     (data: {
@@ -846,6 +920,57 @@ document.addEventListener('DOMContentLoaded', () => {
         Object.keys(messageJsonStore).forEach(
           key => delete messageJsonStore[key],
         );
+
+        socket.off('websocket_frame');
+        socket.on(
+          'websocket_bridge_initialized',
+          (data: {status: string; message?: string; transport?: string}) => {
+            if (data.status === 'success') {
+              chatInput.disabled = true;
+              sendBtn.disabled = true;
+              attachBtn.disabled = true;
+              websocketFrame.disabled = false;
+              sendWebsocketFrameBtn.disabled = false;
+              isConnected = true;
+              const sessionTransport = document.getElementById(
+                'session-transport',
+              ) as HTMLElement;
+              sessionTransport.textContent = data.transport || 'WebSocket';
+              validationErrorsContainer.innerHTML =
+                '<p class="success-text">Declared WebSocket interface is connected.</p>';
+              return;
+            }
+
+            validationErrorsContainer.innerHTML = `<p class="error-text">Error initializing WebSocket bridge: ${data.message}</p>`;
+            websocketFrame.disabled = true;
+            sendWebsocketFrameBtn.disabled = true;
+          },
+        );
+
+        socket.on(
+          'websocket_frame',
+          (frame: {type: 'text' | 'binary'; data: string}) => {
+            const messageId = `websocket-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+            const content =
+              frame.type === 'binary'
+                ? `[binary frame, base64]\n${frame.data}`
+                : frame.data;
+            messageJsonStore[messageId] = {
+              kind: 'message',
+              id: messageId,
+              parts: [{text: content}],
+              validation_errors: [],
+            };
+            appendMessage('agent', content, messageId);
+          },
+        );
+
+        socket.off('websocket_bridge_closed');
+        socket.on('websocket_bridge_closed', (data: {message: string}) => {
+          websocketFrame.disabled = true;
+          sendWebsocketFrameBtn.disabled = true;
+          validationErrorsContainer.innerHTML = `<p class="error-text">WebSocket bridge closed: ${DOMPurify.sanitize(data.message)}</p>`;
+        });
 
         // Set connection state and reset session when connecting to a new agent
         isConnected = true;
@@ -1015,7 +1140,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  const sendWebSocketFrame = () => {
+    const frame = websocketFrame.value;
+    if (!selectedInspectorInterface || !frame || websocketFrame.disabled) {
+      return;
+    }
+    socket.emit('send_websocket_frame', {
+      frame: {type: 'text', data: frame},
+    });
+    websocketFrame.value = '';
+  };
+
   sendBtn.addEventListener('click', sendMessage);
+  sendWebsocketFrameBtn.addEventListener('click', sendWebSocketFrame);
   chatInput.addEventListener('keypress', (e: KeyboardEvent) => {
     if (e.key === 'Enter') sendMessage();
   });

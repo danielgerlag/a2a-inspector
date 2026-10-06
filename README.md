@@ -12,6 +12,17 @@ The application is built with a FastAPI backend and a TypeScript frontend.
 - **Live Chat:** A chat interface to send and receive messages with the connected agent.
 - **Debug Console:** A slide-out console shows the raw JSON-RPC 2.0 messages sent and received between the inspector and the agent server.
 
+### Fork-specific: declared Inspector WebSocket profiles
+
+This fork also recognizes a custom interface only when the Agent Card explicitly
+declares `extensions.a2aInspector` with `profileVersion: 1`,
+`transport: "websocket"`, and a non-empty `subprotocol`. The UI lists each
+valid declaration by its own `protocolBinding`. Selecting one opens its
+declared `ws`/`wss` URL using that declared subprotocol and relays opaque text
+or explicitly base64-encoded binary frames through Socket.IO. It does not
+derive routes, query parameters, operation frames, or event schemas from a
+binding name. Standard A2A JSON-RPC/SSE remains the default interface.
+
 ## Prerequisites
 
 - Python 3.10+

@@ -16,6 +16,7 @@ dependencies = [
     "typing-extensions>=4.12.2",
     "uvicorn>=0.34.0",
     "python-socketio",
+    "websockets>=15.0",
     "jinja2",
     "bleach>=6.2.0",
 ]

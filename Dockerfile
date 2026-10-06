@@ -18,10 +18,9 @@ RUN npm run build
 # Stage 2: Build the final application with the backend
 FROM python:3.12-slim
 WORKDIR /app
-RUN pip install uv
+COPY --from=ghcr.io/astral-sh/uv:0.9.18 /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
-RUN uv sync --no-cache
-RUN uv pip install validators
+RUN uv sync --no-cache --no-dev
 COPY backend/ ./backend/
 RUN mkdir -p /app/frontend
 COPY --from=frontend-builder /app/public /app/frontend/public
