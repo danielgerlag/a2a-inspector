@@ -1,6 +1,9 @@
 import base64
 import logging
+import os
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
 from uuid import uuid4
@@ -8,7 +11,12 @@ from uuid import uuid4
 import bleach
 import httpx
 import socketio
-import validators
+
+
+try:
+    from backend import validators
+except ModuleNotFoundError:
+    import validators
 
 from a2a.client import A2ACardResolver
 from a2a.client.client import Client, ClientConfig
@@ -19,6 +27,7 @@ from a2a.types import (
     Part,
     Role,
     SendMessageRequest,
+    SubscribeToTaskRequest,
 )
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -82,8 +91,9 @@ sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 socket_app = socketio.ASGIApp(sio)
 app.mount('/socket.io', socket_app)
 
-app.mount('/static', StaticFiles(directory='../frontend/public'), name='static')
-templates = Jinja2Templates(directory='../frontend/public')
+static_dir = Path(__file__).resolve().parent.parent / 'frontend' / 'public'
+app.mount('/static', StaticFiles(directory=static_dir), name='static')
+templates = Jinja2Templates(directory=static_dir)
 
 # ==============================================================================
 # State Management
@@ -92,7 +102,18 @@ templates = Jinja2Templates(directory='../frontend/public')
 # NOTE: This global dictionary stores state. For a simple inspector tool with
 # transient connections, this is acceptable. For a scalable production service,
 # a more robust state management solution (e.g., Redis) would be required.
-clients: dict[str, tuple[httpx.AsyncClient, Client, AgentCard, str]] = {}
+@dataclass
+class ClientSession:
+    """The standard A2A clients and HTTP connection for one browser session."""
+
+    httpx_client: httpx.AsyncClient
+    message_client: Client
+    streaming_client: Client
+    agent_card: AgentCard
+    transport: str
+
+
+clients: dict[str, ClientSession] = {}
 
 
 # ==============================================================================
@@ -189,6 +210,15 @@ def _extract_context_id_from_event(event: Any) -> str | None:
     return None
 
 
+def _extract_task_id_from_event(event: Any) -> str | None:
+    """Extract the task ID from a task or task update event."""
+    for attr in ('task_id', 'taskId', 'id'):
+        value = getattr(event, attr, None)
+        if value:
+            return str(value)
+    return None
+
+
 def _unwrap_stream_response(client_event: Any) -> object:
     """Unwrap a StreamResponse or legacy ClientEvent into the inner payload.
 
@@ -254,6 +284,9 @@ async def _process_a2a_response(
     # Serialize
     response_data = _to_dict(event)
     response_data['id'] = response_id
+    task_id = _extract_task_id_from_event(event)
+    if task_id:
+        response_data['taskId'] = task_id
 
     # Normalize kind for frontend (protobuf doesn't have 'kind')
     if 'kind' not in response_data:
@@ -337,7 +370,7 @@ def get_card_resolver(
     return card_resolver
 
 
-def _make_client_config() -> ClientConfig:
+def _make_client_config(*, streaming: bool) -> ClientConfig:
     """Build ClientConfig, handling v1.0 and v0.3 API differences.
 
     v1.0: supported_protocol_bindings param (SCREAMING_SNAKE_CASE enum values)
@@ -352,10 +385,11 @@ def _make_client_config() -> ClientConfig:
                 _TP_GRPC,
             ],
             use_client_preference=True,
+            streaming=streaming,
         )
     except TypeError:
         # v0.3 fallback
-        return ClientConfig(
+        config = ClientConfig(
             supported_transports=[  # type: ignore[call-arg]
                 _TP_JSONRPC,
                 _TP_HTTP_JSON,
@@ -363,6 +397,8 @@ def _make_client_config() -> ClientConfig:
             ],
             use_client_preference=True,
         )
+        config.streaming = streaming
+        return config
 
 
 def _make_message(
@@ -453,6 +489,21 @@ async def _send_message_compat(
     except (TypeError, AttributeError, ValueError):
         # v0.3 fallback: send_message takes a Message directly
         return client.send_message(message)  # type: ignore[arg-type]
+
+
+async def _subscribe_to_task_compat(
+    client: Client,
+    task_id: str,
+) -> Any:
+    """Subscribe through the SDK's standard SubscribeToTask operation."""
+    return client.subscribe(SubscribeToTaskRequest(id=task_id))
+
+
+def _supports_streaming(card: AgentCard) -> bool:
+    """Return whether the Agent Card advertises the standard streaming capability."""
+    return bool(
+        getattr(getattr(card, 'capabilities', None), 'streaming', False)
+    )
 
 
 # ==============================================================================
@@ -558,8 +609,8 @@ async def handle_disconnect(sid: str) -> None:
     """Handle the 'disconnect' socket.io event."""
     logger.info(f'Client disconnected: {sid}')
     if sid in clients:
-        httpx_client, _, _, _ = clients.pop(sid)
-        await httpx_client.aclose()
+        session = clients.pop(sid)
+        await session.httpx_client.aclose()
         logger.info(f'Cleaned up client for {sid}')
 
 
@@ -584,14 +635,22 @@ async def handle_initialize_client(sid: str, data: dict[str, Any]) -> None:
         card_resolver = get_card_resolver(httpx_client, agent_card_url)
         card = await card_resolver.get_agent_card()
 
-        a2a_config = _make_client_config()
-        a2a_config.httpx_client = httpx_client  # type: ignore[attr-defined]
+        message_config = _make_client_config(streaming=False)
+        message_config.httpx_client = httpx_client  # type: ignore[attr-defined]
+        streaming_config = _make_client_config(streaming=True)
+        streaming_config.httpx_client = httpx_client  # type: ignore[attr-defined]
 
-        factory = ClientFactory(a2a_config)
-        a2a_client = factory.create(card)
+        message_client = ClientFactory(message_config).create(card)
+        streaming_client = ClientFactory(streaming_config).create(card)
         transport_protocol = _get_transport_from_card(card)
 
-        clients[sid] = (httpx_client, a2a_client, card, transport_protocol)
+        clients[sid] = ClientSession(
+            httpx_client=httpx_client,
+            message_client=message_client,
+            streaming_client=streaming_client,
+            agent_card=card,
+            transport=transport_protocol,
+        )
 
         input_modes = _get_input_modes(card)
         output_modes = _get_output_modes(card)
@@ -603,6 +662,7 @@ async def handle_initialize_client(sid: str, data: dict[str, Any]) -> None:
                 'transport': str(transport_protocol),
                 'inputModes': input_modes,
                 'outputModes': output_modes,
+                'streaming': _supports_streaming(card),
             },
             to=sid,
         )
@@ -635,7 +695,7 @@ async def handle_send_message(sid: str, json_data: dict[str, Any]) -> None:
         )
         return
 
-    _, a2a_client, _, transport = clients[sid]
+    session = clients[sid]
 
     attachments = json_data.get('attachments', [])
 
@@ -657,14 +717,16 @@ async def handle_send_message(sid: str, json_data: dict[str, Any]) -> None:
     )
 
     debug_request = {
-        'transport': transport,
+        'transport': session.transport,
         'method': 'SendMessage',  # v1.0 PascalCase (was 'message/send' in v0.3)
         'message': _to_dict(message),
     }
     await _emit_debug_log(sid, message_id, 'request', debug_request)
 
     try:
-        response_stream = await _send_message_compat(a2a_client, message)
+        response_stream = await _send_message_compat(
+            session.message_client, message
+        )
         async for stream_result in response_stream:
             await _process_a2a_response(stream_result, sid, message_id)
 
@@ -673,6 +735,128 @@ async def handle_send_message(sid: str, json_data: dict[str, Any]) -> None:
         await sio.emit(
             'agent_response',
             {'error': f'Failed to send message: {e}', 'id': message_id},
+            to=sid,
+        )
+
+
+@sio.on('send_streaming_message')
+async def handle_send_streaming_message(
+    sid: str, json_data: dict[str, Any]
+) -> None:
+    """Send through the SDK, which selects standard SendStreamingMessage/SSE."""
+    message_id = json_data.get('id', str(uuid4()))
+    if sid not in clients:
+        await sio.emit(
+            'agent_response',
+            {'error': 'Client not initialized.', 'id': message_id},
+            to=sid,
+        )
+        return
+
+    session = clients[sid]
+    if not _supports_streaming(session.agent_card):
+        await sio.emit(
+            'agent_response',
+            {
+                'error': 'The Agent Card does not advertise streaming.',
+                'id': message_id,
+            },
+            to=sid,
+        )
+        return
+
+    message_text = bleach.clean(json_data.get('message', ''))
+    parts: list[Any] = []
+    if message_text:
+        parts.append(_make_text_part(str(message_text)))
+    for attachment in json_data.get('attachments', []):
+        parts.append(_make_file_part(attachment['data'], attachment['mimeType']))
+
+    message = _make_message(
+        role=_get_role_user(),
+        parts=parts,
+        message_id=message_id,
+        context_id=json_data.get('contextId'),
+        metadata=json_data.get('metadata', {}),
+    )
+    await _emit_debug_log(
+        sid,
+        message_id,
+        'request',
+        {
+            'transport': session.transport,
+            'method': 'SendStreamingMessage',
+            'message': _to_dict(message),
+        },
+    )
+
+    try:
+        response_stream = await _send_message_compat(
+            session.streaming_client, message
+        )
+        async for stream_result in response_stream:
+            await _process_a2a_response(stream_result, sid, message_id)
+    except Exception as e:
+        logger.error(
+            f'Failed to send streaming message for sid {sid}', exc_info=True
+        )
+        await sio.emit(
+            'agent_response',
+            {'error': f'Failed to stream message: {e}', 'id': message_id},
+            to=sid,
+        )
+
+
+@sio.on('subscribe_to_task')
+async def handle_subscribe_to_task(
+    sid: str, json_data: dict[str, Any]
+) -> None:
+    """Resume a known task through the SDK's standard SubscribeToTask call."""
+    task_id = json_data.get('taskId')
+    if not isinstance(task_id, str) or not task_id:
+        await sio.emit(
+            'agent_response',
+            {'error': 'A task ID is required to subscribe.', 'id': str(uuid4())},
+            to=sid,
+        )
+        return
+    if sid not in clients:
+        await sio.emit(
+            'agent_response',
+            {'error': 'Client not initialized.', 'id': task_id},
+            to=sid,
+        )
+        return
+
+    session = clients[sid]
+    if not _supports_streaming(session.agent_card):
+        await sio.emit(
+            'agent_response',
+            {
+                'error': 'The Agent Card does not advertise streaming.',
+                'id': task_id,
+            },
+            to=sid,
+        )
+        return
+
+    await _emit_debug_log(
+        sid,
+        task_id,
+        'request',
+        {'transport': session.transport, 'method': 'SubscribeToTask', 'id': task_id},
+    )
+    try:
+        response_stream = await _subscribe_to_task_compat(
+            session.streaming_client, task_id
+        )
+        async for stream_result in response_stream:
+            await _process_a2a_response(stream_result, sid, task_id)
+    except Exception as e:
+        logger.error(f'Failed to subscribe to task {task_id}', exc_info=True)
+        await sio.emit(
+            'agent_response',
+            {'error': f'Failed to subscribe to task: {e}', 'id': task_id},
             to=sid,
         )
 
@@ -687,4 +871,9 @@ if __name__ == '__main__':
 
     # NOTE: The 'reload=True' flag is for development purposes only.
     # In a production environment, use a proper process manager like Gunicorn.
-    uvicorn.run('app:app', host='127.0.0.1', port=5001, reload=True)
+    uvicorn.run(
+        'app:app',
+        host='127.0.0.1',
+        port=int(os.environ.get('A2A_INSPECTOR_PORT', '5001')),
+        reload=True,
+    )

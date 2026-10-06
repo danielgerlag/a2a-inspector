@@ -54,7 +54,7 @@ echo -e "${GREEN}Starting A2A Inspector...${NC}"
 # Start frontend build in watch mode
 echo -e "${BLUE}Starting frontend build (watch mode)...${NC}"
 cd ./frontend || exit
-npm run build -- --watch 2>&1 | sed "s/^/\\x1b[36m[FRONTEND]\\x1b[0m /" &
+npm run build -- --watch=forever 2>&1 | sed "s/^/\\x1b[36m[FRONTEND]\\x1b[0m /" &
 FRONTEND_PID=$!
 cd - > /dev/null || exit
 

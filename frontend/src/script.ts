@@ -69,6 +69,7 @@ type TaskState = string;
 interface AgentResponseEvent {
   kind: 'task' | 'status-update' | 'artifact-update' | 'message';
   id: string;
+  taskId?: string;
   contextId?: string;
   error?: string;
   status?: {
@@ -206,6 +207,12 @@ document.addEventListener('DOMContentLoaded', () => {
   ) as HTMLElement;
   const chatInput = document.getElementById('chat-input') as HTMLInputElement;
   const sendBtn = document.getElementById('send-btn') as HTMLButtonElement;
+  const sendStreamingBtn = document.getElementById(
+    'send-streaming-btn',
+  ) as HTMLButtonElement;
+  const resumeTaskBtn = document.getElementById(
+    'resume-task-btn',
+  ) as HTMLButtonElement;
   const chatMessages = document.getElementById('chat-messages') as HTMLElement;
   const debugConsole = document.getElementById('debug-console') as HTMLElement;
   const debugHandle = document.getElementById('debug-handle') as HTMLElement;
@@ -233,7 +240,10 @@ document.addEventListener('DOMContentLoaded', () => {
   ) as HTMLElement;
 
   let contextId: string | null = null;
+  let activeTaskId: string | null = null;
+  let activeTaskIsTerminal = false;
   let isConnected = false;
+  let streamingSupported = false;
   let supportedInputModes: string[] = ['text/plain'];
   let supportedOutputModes: string[] = ['text/plain'];
   let isResizing = false;
@@ -771,6 +781,7 @@ document.addEventListener('DOMContentLoaded', () => {
       '<div class="loader"></div><p class="placeholder-text">Fetching Agent Card...</p>';
     chatInput.disabled = true;
     sendBtn.disabled = true;
+    sendStreamingBtn.disabled = true;
 
     const customHeaders = getCustomHeaders();
     const requestHeaders = {
@@ -833,11 +844,16 @@ document.addEventListener('DOMContentLoaded', () => {
       transport?: string;
       inputModes?: string[];
       outputModes?: string[];
+      streaming?: boolean;
     }) => {
       clearTimeout(initializationTimeout);
       if (data.status === 'success') {
         chatInput.disabled = false;
         sendBtn.disabled = false;
+        streamingSupported = data.streaming === true;
+        sendStreamingBtn.hidden = !streamingSupported;
+        sendStreamingBtn.disabled = !streamingSupported;
+        resumeTaskBtn.hidden = !streamingSupported;
         chatMessages.innerHTML =
           '<p class="placeholder-text">💬 Send a message to start chatting with the agent.</p>';
         debugContent.innerHTML = '';
@@ -870,9 +886,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Enable attach button
         attachBtn.disabled = false;
+        updateStreamingControls();
       } else {
         validationErrorsContainer.innerHTML = `<p class="error-text">Error initializing client: ${data.message}</p>`;
         isConnected = false;
+        streamingSupported = false;
+        sendStreamingBtn.hidden = true;
+        resumeTaskBtn.hidden = true;
         updateSessionUI();
       }
     },
@@ -951,11 +971,28 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  const updateStreamingControls = () => {
+    sendStreamingBtn.disabled = !isConnected || !streamingSupported;
+    resumeTaskBtn.disabled =
+      !isConnected ||
+      !streamingSupported ||
+      !activeTaskId ||
+      activeTaskIsTerminal;
+
+    const taskDetails = document.getElementById('task-details');
+    if (taskDetails) {
+      taskDetails.textContent = activeTaskId ?? 'No active task';
+    }
+  };
+
   const resetSession = () => {
     contextId = null;
+    activeTaskId = null;
+    activeTaskIsTerminal = false;
     chatMessages.innerHTML =
       '<p class="placeholder-text">💬 Send a message to start chatting with the agent.</p>';
     updateSessionUI();
+    updateStreamingControls();
   };
 
   const showLoadingIndicator = () => {
@@ -977,7 +1014,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
-  const sendMessage = () => {
+  const sendMessage = (streaming = false) => {
     const messageText = chatInput.value;
     if ((messageText.trim() || attachments.length > 0) && !chatInput.disabled) {
       const sanitizedMessage = DOMPurify.sanitize(messageText);
@@ -1001,7 +1038,7 @@ document.addEventListener('DOMContentLoaded', () => {
         mimeType: a.mimeType,
       }));
 
-      socket.emit('send_message', {
+      socket.emit(streaming ? 'send_streaming_message' : 'send_message', {
         message: sanitizedMessage,
         id: messageId,
         contextId,
@@ -1015,7 +1052,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
-  sendBtn.addEventListener('click', sendMessage);
+  sendBtn.addEventListener('click', () => sendMessage());
+  sendStreamingBtn.addEventListener('click', () => sendMessage(true));
+  resumeTaskBtn.addEventListener('click', () => {
+    if (activeTaskId && !activeTaskIsTerminal) {
+      showLoadingIndicator();
+      socket.emit('subscribe_to_task', {taskId: activeTaskId});
+    }
+  });
   chatInput.addEventListener('keypress', (e: KeyboardEvent) => {
     if (e.key === 'Enter') sendMessage();
   });
@@ -1128,6 +1172,25 @@ document.addEventListener('DOMContentLoaded', () => {
       contextId = event.contextId;
       updateSessionUI();
     }
+
+    if (
+      (event.kind === 'task' ||
+        event.kind === 'status-update' ||
+        event.kind === 'artifact-update') &&
+      event.taskId
+    ) {
+      activeTaskId = event.taskId;
+    }
+    if (event.status?.state) {
+      const state = normalizeTaskState(event.status.state);
+      activeTaskIsTerminal = [
+        'completed',
+        'failed',
+        'canceled',
+        'rejected',
+      ].includes(state);
+    }
+    updateStreamingControls();
 
     switch (event.kind) {
       case 'task': {
