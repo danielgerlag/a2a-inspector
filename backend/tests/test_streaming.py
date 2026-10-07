@@ -14,13 +14,15 @@ class StreamingClient:
     def __init__(self) -> None:
         self.message_requests = []
         self.subscription_requests = []
+        self.subscription_contexts = []
 
     async def send_message(self, request):
         self.message_requests.append(request)
         yield object()
 
-    async def subscribe(self, request):
+    async def subscribe(self, request, context=None):
         self.subscription_requests.append(request)
+        self.subscription_contexts.append(context)
         yield object()
 
 
@@ -97,3 +99,20 @@ async def test_subscribe_to_task_uses_sdk_subscribe(monkeypatch):
         and call.args[1]['data']['method'] == 'SubscribeToTask'
         for call in emit.await_args_list
     )
+
+
+@pytest.mark.asyncio
+async def test_subscribe_to_task_sends_last_event_id(monkeypatch):
+    client = StreamingClient()
+    inspector.clients['socket-1'] = make_session(client)
+    monkeypatch.setattr(inspector, '_process_a2a_response', AsyncMock())
+    monkeypatch.setattr(inspector.sio, 'emit', AsyncMock())
+
+    try:
+        await inspector.handle_subscribe_to_task(
+            'socket-1', {'taskId': 'task-42', 'lastEventId': '17'}
+        )
+    finally:
+        inspector.clients.pop('socket-1', None)
+
+    assert client.subscription_contexts[0].service_parameters['Last-Event-ID'] == '17'

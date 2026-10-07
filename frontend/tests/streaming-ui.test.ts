@@ -25,6 +25,8 @@ describe('A2A streaming controls', () => {
   it('uses the standard streaming and subscription actions', () => {
     expect(source).toContain("'send_streaming_message'");
     expect(source).toContain("'subscribe_to_task'");
+    expect(source).toContain('lastEventId');
+    expect(source).not.toContain('activeTaskIsTerminal');
     expect(source).toContain('event.taskId');
     expect(source).not.toMatch(/websocket|websocket/i);
   });

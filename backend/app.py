@@ -19,7 +19,7 @@ except ModuleNotFoundError:
     import validators
 
 from a2a.client import A2ACardResolver
-from a2a.client.client import Client, ClientConfig
+from a2a.client.client import Client, ClientCallContext, ClientConfig
 from a2a.client.client_factory import ClientFactory
 from a2a.types import (
     AgentCard,
@@ -494,9 +494,15 @@ async def _send_message_compat(
 async def _subscribe_to_task_compat(
     client: Client,
     task_id: str,
+    last_event_id: str | None = None,
 ) -> Any:
     """Subscribe through the SDK's standard SubscribeToTask operation."""
-    return client.subscribe(SubscribeToTaskRequest(id=task_id))
+    context = None
+    if last_event_id and last_event_id.isdigit():
+        context = ClientCallContext(
+            service_parameters={'Last-Event-ID': last_event_id}
+        )
+    return client.subscribe(SubscribeToTaskRequest(id=task_id), context=context)
 
 
 def _supports_streaming(card: AgentCard) -> bool:
@@ -813,6 +819,9 @@ async def handle_subscribe_to_task(
 ) -> None:
     """Resume a known task through the SDK's standard SubscribeToTask call."""
     task_id = json_data.get('taskId')
+    last_event_id = json_data.get('lastEventId')
+    if not isinstance(last_event_id, str) or not last_event_id.isdigit():
+        last_event_id = None
     if not isinstance(task_id, str) or not task_id:
         await sio.emit(
             'agent_response',
@@ -848,7 +857,7 @@ async def handle_subscribe_to_task(
     )
     try:
         response_stream = await _subscribe_to_task_compat(
-            session.streaming_client, task_id
+            session.streaming_client, task_id, last_event_id
         )
         async for stream_result in response_stream:
             await _process_a2a_response(stream_result, sid, task_id)

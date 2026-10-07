@@ -74,9 +74,10 @@ interface AgentResponseEvent {
   error?: string;
   status?: {
     state: TaskState;
-    message?: {parts?: A2APart[]};
+    message?: {messageId?: string; parts?: A2APart[]};
   };
   artifact?: {
+    artifactId?: string;
     parts?: A2APart[];
   };
   artifacts?: Array<{
@@ -241,7 +242,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let contextId: string | null = null;
   let activeTaskId: string | null = null;
-  let activeTaskIsTerminal = false;
+  let lastEventId: string | null = null;
   let isConnected = false;
   let streamingSupported = false;
   let supportedInputModes: string[] = ['text/plain'];
@@ -971,13 +972,22 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  const rememberEventCursor = (event: AgentResponseEvent) => {
+    const candidates = [
+      event.status?.message?.messageId,
+      event.artifact?.artifactId,
+    ];
+    for (const candidate of candidates) {
+      if (!candidate || !/^\d+$/.test(candidate)) continue;
+      if (lastEventId === null || BigInt(candidate) > BigInt(lastEventId)) {
+        lastEventId = candidate;
+      }
+    }
+  };
+
   const updateStreamingControls = () => {
     sendStreamingBtn.disabled = !isConnected || !streamingSupported;
-    resumeTaskBtn.disabled =
-      !isConnected ||
-      !streamingSupported ||
-      !activeTaskId ||
-      activeTaskIsTerminal;
+    resumeTaskBtn.disabled = !isConnected || !streamingSupported;
 
     const taskDetails = document.getElementById('task-details');
     if (taskDetails) {
@@ -988,7 +998,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const resetSession = () => {
     contextId = null;
     activeTaskId = null;
-    activeTaskIsTerminal = false;
+    lastEventId = null;
     chatMessages.innerHTML =
       '<p class="placeholder-text">💬 Send a message to start chatting with the agent.</p>';
     updateSessionUI();
@@ -1055,10 +1065,12 @@ document.addEventListener('DOMContentLoaded', () => {
   sendBtn.addEventListener('click', () => sendMessage());
   sendStreamingBtn.addEventListener('click', () => sendMessage(true));
   resumeTaskBtn.addEventListener('click', () => {
-    if (activeTaskId && !activeTaskIsTerminal) {
-      showLoadingIndicator();
-      socket.emit('subscribe_to_task', {taskId: activeTaskId});
-    }
+    const taskId = activeTaskId || contextId || window.prompt('Task ID to resume');
+    if (!taskId) return;
+    activeTaskId = taskId;
+    updateStreamingControls();
+    showLoadingIndicator();
+    socket.emit('subscribe_to_task', {taskId, lastEventId});
   });
   chatInput.addEventListener('keypress', (e: KeyboardEvent) => {
     if (e.key === 'Enter') sendMessage();
@@ -1173,23 +1185,9 @@ document.addEventListener('DOMContentLoaded', () => {
       updateSessionUI();
     }
 
-    if (
-      (event.kind === 'task' ||
-        event.kind === 'status-update' ||
-        event.kind === 'artifact-update') &&
-      event.taskId
-    ) {
-      activeTaskId = event.taskId;
-    }
-    if (event.status?.state) {
-      const state = normalizeTaskState(event.status.state);
-      activeTaskIsTerminal = [
-        'completed',
-        'failed',
-        'canceled',
-        'rejected',
-      ].includes(state);
-    }
+    const taskId = event.taskId || event.contextId;
+    if (taskId) activeTaskId = taskId;
+    rememberEventCursor(event);
     updateStreamingControls();
 
     switch (event.kind) {
