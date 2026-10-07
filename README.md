@@ -11,6 +11,7 @@ The application is built with a FastAPI backend and a TypeScript frontend.
 - **Spec Compliance Checks:** Performs basic validation on the agent card to ensure it adheres to the A2A specification.
 - **Live Chat:** A chat interface to send and receive messages with the connected agent.
 - **Standard A2A streaming:** If the Agent Card advertises `capabilities.streaming`, use **Send streaming** to send `SendStreamingMessage`. Inspector renders status and artifact updates. Use **Resume task stream** to send `SubscribeToTask` for a known nonterminal task.
+- **Task-bound current results:** After a subscription is active, send a new streaming message asking for current results on the same task. Inspector renders the returned `current_query_results` data artifact; no query, source, Cypher, or filter input is needed.
 - **Debug Console:** A slide-out console shows the raw JSON-RPC 2.0 messages sent and received between the inspector and the agent server.
 
 ## Prerequisites
