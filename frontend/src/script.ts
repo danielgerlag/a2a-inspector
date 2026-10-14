@@ -1052,6 +1052,7 @@ document.addEventListener('DOMContentLoaded', () => {
         message: sanitizedMessage,
         id: messageId,
         contextId,
+        taskId: activeTaskId,
         metadata,
         attachments: attachmentsToSend,
       });

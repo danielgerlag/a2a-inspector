@@ -407,6 +407,7 @@ def _make_message(
     message_id: str,
     context_id: str | None,
     metadata: dict[str, Any],
+    task_id: str | None = None,
 ) -> Message:
     """Build a Message, compatible with both v1.0 (protobuf) and v0.3 (Pydantic)."""
     kwargs: dict[str, Any] = {
@@ -416,6 +417,8 @@ def _make_message(
     }
     if context_id:
         kwargs['context_id'] = context_id
+    if task_id:
+        kwargs['task_id'] = task_id
     if metadata:
         kwargs['metadata'] = metadata  # type: ignore[assignment]
     return Message(**kwargs)
@@ -720,6 +723,7 @@ async def handle_send_message(sid: str, json_data: dict[str, Any]) -> None:
         message_id=message_id,
         context_id=context_id,
         metadata=metadata,
+        task_id=json_data.get('taskId') or context_id,
     )
 
     debug_request = {
@@ -784,6 +788,7 @@ async def handle_send_streaming_message(
         message_id=message_id,
         context_id=json_data.get('contextId'),
         metadata=json_data.get('metadata', {}),
+        task_id=json_data.get('taskId') or json_data.get('contextId'),
     )
     await _emit_debug_log(
         sid,
