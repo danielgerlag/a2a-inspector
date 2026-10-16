@@ -49,6 +49,12 @@ def make_session(client: StreamingClient) -> inspector.ClientSession:
     )
 
 
+def test_streaming_client_has_no_read_timeout():
+    timeout = inspector._streaming_timeout()
+    assert timeout.read is None
+    assert timeout.connect == 30.0
+
+
 def test_client_config_can_preserve_send_message_or_enable_streaming():
     assert inspector._make_client_config(streaming=False).streaming is False
     assert inspector._make_client_config(streaming=True).streaming is True

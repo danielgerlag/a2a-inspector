@@ -103,6 +103,11 @@ templates = Jinja2Templates(directory=static_dir)
 # NOTE: This global dictionary stores state. For a simple inspector tool with
 # transient connections, this is acceptable. For a scalable production service,
 # a more robust state management solution (e.g., Redis) would be required.
+def _streaming_timeout() -> httpx.Timeout:
+    """A watch stream stays open for hours or days. Do not time out a quiet read."""
+    return httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
+
+
 @dataclass
 class ClientSession:
     """The standard A2A clients and HTTP connection for one browser session."""
@@ -112,6 +117,7 @@ class ClientSession:
     streaming_client: Client
     agent_card: AgentCard
     transport: str
+    streaming_httpx_client: httpx.AsyncClient | None = None
 
 
 clients: dict[str, ClientSession] = {}
@@ -676,6 +682,8 @@ async def handle_disconnect(sid: str) -> None:
     if sid in clients:
         session = clients.pop(sid)
         await session.httpx_client.aclose()
+        if session.streaming_httpx_client is not None:
+            await session.streaming_httpx_client.aclose()
         logger.info(f'Cleaned up client for {sid}')
 
 
@@ -695,15 +703,19 @@ async def handle_initialize_client(sid: str, data: dict[str, Any]) -> None:
         return
 
     httpx_client = None
+    streaming_httpx_client = None
     try:
         httpx_client = httpx.AsyncClient(timeout=600.0, headers=custom_headers)
+        streaming_httpx_client = httpx.AsyncClient(
+            timeout=_streaming_timeout(), headers=custom_headers
+        )
         card_resolver = get_card_resolver(httpx_client, agent_card_url)
         card = await card_resolver.get_agent_card()
 
         message_config = _make_client_config(streaming=False)
         message_config.httpx_client = httpx_client  # type: ignore[attr-defined]
         streaming_config = _make_client_config(streaming=True)
-        streaming_config.httpx_client = httpx_client  # type: ignore[attr-defined]
+        streaming_config.httpx_client = streaming_httpx_client  # type: ignore[attr-defined]
 
         message_client = ClientFactory(message_config).create(card)
         streaming_client = ClientFactory(streaming_config).create(card)
@@ -715,6 +727,7 @@ async def handle_initialize_client(sid: str, data: dict[str, Any]) -> None:
             streaming_client=streaming_client,
             agent_card=card,
             transport=transport_protocol,
+            streaming_httpx_client=streaming_httpx_client,
         )
 
         input_modes = _get_input_modes(card)
@@ -736,6 +749,8 @@ async def handle_initialize_client(sid: str, data: dict[str, Any]) -> None:
             f'Failed to initialize client for {sid}: {e}', exc_info=True
         )
         # Clean up httpx_client
+        if streaming_httpx_client is not None:
+            await streaming_httpx_client.aclose()
         if httpx_client is not None:
             await httpx_client.aclose()
         await sio.emit(
