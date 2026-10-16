@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import logging
 import os
@@ -114,6 +115,8 @@ class ClientSession:
 
 
 clients: dict[str, ClientSession] = {}
+streams: dict[tuple[str, str], asyncio.Task[None]] = {}
+stream_readers: set[asyncio.Task[None]] = set()
 
 
 # ==============================================================================
@@ -478,17 +481,23 @@ def _get_role_user() -> Any:
 async def _send_message_compat(
     client: Client,
     message: Message,
+    last_event_id: str | None = None,
 ) -> Any:
     """Call client.send_message with v1.0 or v0.3 API.
 
     v1.0: client.send_message(SendMessageRequest(request=message)) -> AsyncIterator[ClientEvent]
     v0.3: client.send_message(message) -> AsyncIterator[ClientEvent]
     """
+    context = None
+    if last_event_id and last_event_id.isdigit():
+        context = ClientCallContext(service_parameters={'Last-Event-ID': last_event_id})
     # v1.0: send_message() requires a SendMessageRequest protobuf wrapper.
     # The wrapper field is "message" (not "request" — that was pre-alpha naming).
     try:
         request = SendMessageRequest(message=message)
-        return client.send_message(request)
+        if context is None:
+            return client.send_message(request)
+        return client.send_message(request, context=context)
     except (TypeError, AttributeError, ValueError):
         # v0.3 fallback: send_message takes a Message directly
         return client.send_message(message)  # type: ignore[arg-type]
@@ -506,6 +515,53 @@ async def _subscribe_to_task_compat(
             service_parameters={'Last-Event-ID': last_event_id}
         )
     return client.subscribe(SubscribeToTaskRequest(id=task_id), context=context)
+
+
+def _start_stream(sid: str, assumed_task: str, response_stream: Any, message_id: str) -> None:
+    """Read one SSE stream. A later stream for the same task replaces it."""
+
+    async def read() -> None:
+        owner: tuple[str, str] | None = None
+        try:
+            async for stream_result in response_stream:
+                extracted = _extract_task_id_from_event(
+                    _unwrap_stream_response(stream_result)
+                )
+                event_task = extracted or assumed_task
+                key = (sid, event_task)
+                if owner is None:
+                    owner = key
+                    current = asyncio.current_task()
+                    previous = streams.get(key)
+                    if (
+                        extracted
+                        and extracted == assumed_task
+                        and previous is not None
+                        and previous is not current
+                        and not previous.done()
+                    ):
+                        previous.cancel()
+                    if current is not None:
+                        streams[key] = current
+                await _process_a2a_response(stream_result, sid, message_id)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            logger.error('Failed to read stream for %s', assumed_task, exc_info=True)
+            await sio.emit(
+                'agent_response',
+                {'error': f'Failed to stream message: {e}', 'id': message_id},
+                to=sid,
+            )
+        finally:
+            if owner is not None and streams.get(owner) is asyncio.current_task():
+                streams.pop(owner, None)
+            current = asyncio.current_task()
+            if current is not None:
+                stream_readers.discard(current)
+
+    task = asyncio.create_task(read())
+    stream_readers.add(task)
 
 
 def _supports_streaming(card: AgentCard) -> bool:
@@ -782,13 +838,14 @@ async def handle_send_streaming_message(
     for attachment in json_data.get('attachments', []):
         parts.append(_make_file_part(attachment['data'], attachment['mimeType']))
 
+    continued = json_data.get('taskId') or json_data.get('contextId')
     message = _make_message(
         role=_get_role_user(),
         parts=parts,
         message_id=message_id,
         context_id=json_data.get('contextId'),
         metadata=json_data.get('metadata', {}),
-        task_id=json_data.get('taskId') or json_data.get('contextId'),
+        task_id=continued,
     )
     await _emit_debug_log(
         sid,
@@ -801,12 +858,13 @@ async def handle_send_streaming_message(
         },
     )
 
+    last_event_id = json_data.get('lastEventId')
+    if not isinstance(last_event_id, str) or not last_event_id.isdigit():
+        last_event_id = None
     try:
         response_stream = await _send_message_compat(
-            session.streaming_client, message
+            session.streaming_client, message, last_event_id
         )
-        async for stream_result in response_stream:
-            await _process_a2a_response(stream_result, sid, message_id)
     except Exception as e:
         logger.error(
             f'Failed to send streaming message for sid {sid}', exc_info=True
@@ -816,6 +874,10 @@ async def handle_send_streaming_message(
             {'error': f'Failed to stream message: {e}', 'id': message_id},
             to=sid,
         )
+        return
+
+    task_key = continued if isinstance(continued, str) and continued else message_id
+    _start_stream(sid, task_key, response_stream, message_id)
 
 
 @sio.on('subscribe_to_task')
@@ -864,8 +926,8 @@ async def handle_subscribe_to_task(
         response_stream = await _subscribe_to_task_compat(
             session.streaming_client, task_id, last_event_id
         )
-        async for stream_result in response_stream:
-            await _process_a2a_response(stream_result, sid, task_id)
+        _start_stream(sid, task_id, response_stream, task_id)
+        return
     except Exception as e:
         logger.error(f'Failed to subscribe to task {task_id}', exc_info=True)
         await sio.emit(

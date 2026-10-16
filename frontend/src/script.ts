@@ -242,7 +242,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   let contextId: string | null = null;
   let activeTaskId: string | null = null;
-  let lastEventId: string | null = null;
+  let awaitingSplitTask = false;
+  const eventCursors = new Map<string, string>();
   let isConnected = false;
   let streamingSupported = false;
   let supportedInputModes: string[] = ['text/plain'];
@@ -972,17 +973,47 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   };
 
+  const seenEvents = new Set<string>();
+
+  const eventKey = (event: AgentResponseEvent): string | null => {
+    const taskId = event.taskId || event.contextId;
+    const sequence = event.artifact?.artifactId || event.status?.message?.messageId;
+    return taskId && sequence ? `${taskId}:${sequence}:${event.kind}` : null;
+  };
+
+  const isDataArtifact = (event: AgentResponseEvent): boolean =>
+    (event.artifact?.parts ?? []).some(part => part.data !== undefined);
+
   const rememberEventCursor = (event: AgentResponseEvent) => {
+    const taskId = event.taskId || event.contextId;
+    if (!taskId) return;
     const candidates = [
       event.status?.message?.messageId,
       event.artifact?.artifactId,
     ];
     for (const candidate of candidates) {
       if (!candidate || !/^\d+$/.test(candidate)) continue;
-      if (lastEventId === null || BigInt(candidate) > BigInt(lastEventId)) {
-        lastEventId = candidate;
+      const current = eventCursors.get(taskId) ?? null;
+      if (current === null || BigInt(candidate) > BigInt(current)) {
+        eventCursors.set(taskId, candidate);
       }
     }
+  };
+
+  const adoptAddressedTask = (event: AgentResponseEvent) => {
+    const taskId = event.taskId || event.contextId;
+    if (!taskId) return;
+    if (!activeTaskId) {
+      activeTaskId = taskId;
+      return;
+    }
+    if (taskId === activeTaskId) {
+      if (!isDataArtifact(event)) awaitingSplitTask = false;
+      return;
+    }
+    if (isDataArtifact(event) || !awaitingSplitTask) return;
+    activeTaskId = taskId;
+    awaitingSplitTask = false;
   };
 
   const updateStreamingControls = () => {
@@ -998,7 +1029,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const resetSession = () => {
     contextId = null;
     activeTaskId = null;
-    lastEventId = null;
+    awaitingSplitTask = false;
+    eventCursors.clear();
+    seenEvents.clear();
     chatMessages.innerHTML =
       '<p class="placeholder-text">💬 Send a message to start chatting with the agent.</p>';
     updateSessionUI();
@@ -1048,11 +1081,14 @@ document.addEventListener('DOMContentLoaded', () => {
         mimeType: a.mimeType,
       }));
 
+      if (activeTaskId) awaitingSplitTask = true;
+      const lastEventId = activeTaskId ? eventCursors.get(activeTaskId) ?? null : null;
       socket.emit(streaming ? 'send_streaming_message' : 'send_message', {
         message: sanitizedMessage,
         id: messageId,
         contextId,
         taskId: activeTaskId,
+        lastEventId,
         metadata,
         attachments: attachmentsToSend,
       });
@@ -1071,10 +1107,13 @@ document.addEventListener('DOMContentLoaded', () => {
     activeTaskId = taskId;
     updateStreamingControls();
     showLoadingIndicator();
-    socket.emit('subscribe_to_task', {taskId, lastEventId});
+    socket.emit('subscribe_to_task', {
+      taskId,
+      lastEventId: eventCursors.get(taskId) ?? null,
+    });
   });
   chatInput.addEventListener('keypress', (e: KeyboardEvent) => {
-    if (e.key === 'Enter') sendMessage();
+    if (e.key === 'Enter') sendMessage(streamingSupported);
   });
 
   const renderMultimediaContent = (uri: string, mimeType: string): string => {
@@ -1181,13 +1220,14 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
-    if (event.contextId) {
+    adoptAddressedTask(event);
+    if (!contextId && event.contextId) {
       contextId = event.contextId;
       updateSessionUI();
     }
-
-    const taskId = event.taskId || event.contextId;
-    if (taskId) activeTaskId = taskId;
+    const rendered = eventKey(event);
+    if (rendered && seenEvents.has(rendered)) return;
+    if (rendered) seenEvents.add(rendered);
     rememberEventCursor(event);
     updateStreamingControls();
 

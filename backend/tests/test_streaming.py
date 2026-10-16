@@ -1,5 +1,6 @@
 """Tests for standard A2A streaming inspector actions."""
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,17 +14,27 @@ class StreamingClient:
 
     def __init__(self) -> None:
         self.message_requests = []
+        self.message_contexts = []
         self.subscription_requests = []
         self.subscription_contexts = []
 
-    async def send_message(self, request):
+    async def send_message(self, request, context=None):
         self.message_requests.append(request)
+        self.message_contexts.append(context)
         yield object()
 
     async def subscribe(self, request, context=None):
         self.subscription_requests.append(request)
         self.subscription_contexts.append(context)
         yield object()
+
+
+async def finish_streams() -> None:
+    tasks = list(inspector.stream_readers)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    inspector.streams.clear()
+    inspector.stream_readers.clear()
 
 
 def make_session(client: StreamingClient) -> inspector.ClientSession:
@@ -64,6 +75,7 @@ async def test_streaming_message_uses_sdk_streaming_client(monkeypatch):
         )
     finally:
         inspector.clients.pop('socket-1', None)
+    await finish_streams()
 
     assert len(client.message_requests) == 1
     assert client.message_requests[0].message.message_id == 'message-1'
@@ -90,6 +102,7 @@ async def test_subscribe_to_task_uses_sdk_subscribe(monkeypatch):
         )
     finally:
         inspector.clients.pop('socket-1', None)
+    await finish_streams()
 
     assert len(client.subscription_requests) == 1
     assert client.subscription_requests[0].id == 'task-42'
@@ -114,5 +127,105 @@ async def test_subscribe_to_task_sends_last_event_id(monkeypatch):
         )
     finally:
         inspector.clients.pop('socket-1', None)
+    await finish_streams()
 
     assert client.subscription_contexts[0].service_parameters['Last-Event-ID'] == '17'
+
+
+@pytest.mark.asyncio
+async def test_streaming_message_sends_last_event_id(monkeypatch):
+    client = StreamingClient()
+    inspector.clients['socket-1'] = make_session(client)
+    monkeypatch.setattr(inspector, '_process_a2a_response', AsyncMock())
+    monkeypatch.setattr(inspector.sio, 'emit', AsyncMock())
+
+    try:
+        await inspector.handle_send_streaming_message(
+            'socket-1',
+            {
+                'id': 'message-2',
+                'message': 'preparing',
+                'taskId': 'watch-1',
+                'lastEventId': '4',
+                'metadata': {},
+                'attachments': [],
+            },
+        )
+    finally:
+        inspector.clients.pop('socket-1', None)
+    await finish_streams()
+
+    assert client.message_contexts[0].service_parameters['Last-Event-ID'] == '4'
+
+
+@pytest.mark.asyncio
+async def test_new_task_stream_does_not_cancel_the_previous_watch(monkeypatch):
+    cancelled = False
+
+    async def previous_watch():
+        nonlocal cancelled
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    previous = asyncio.create_task(previous_watch())
+    inspector.streams[('socket-1', 'watch-1')] = previous
+
+    async def new_watch():
+        yield SimpleNamespace(task_id='watch-2')
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(inspector, '_process_a2a_response', AsyncMock())
+    inspector._start_stream('socket-1', 'watch-1', new_watch(), 'msg-parking')
+    await asyncio.sleep(0)
+    try:
+        assert cancelled is False
+        assert ('socket-1', 'watch-1') in inspector.streams
+        assert ('socket-1', 'watch-2') in inspector.streams
+    finally:
+        for task in list(inspector.streams.values()) + list(inspector.stream_readers):
+            task.cancel()
+        await asyncio.gather(
+            *list(inspector.streams.values()) + list(inspector.stream_readers),
+            return_exceptions=True,
+        )
+        inspector.streams.clear()
+        inspector.stream_readers.clear()
+
+
+@pytest.mark.asyncio
+async def test_same_task_stream_replaces_the_previous_reader(monkeypatch):
+    cancelled = False
+
+    async def previous_watch():
+        nonlocal cancelled
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    previous = asyncio.create_task(previous_watch())
+    inspector.streams[('socket-1', 'watch-1')] = previous
+
+    async def replacement():
+        yield SimpleNamespace(task_id='watch-1')
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(inspector, '_process_a2a_response', AsyncMock())
+    inspector._start_stream('socket-1', 'watch-1', replacement(), 'msg-2')
+    await asyncio.wait({previous}, timeout=1)
+    try:
+        assert cancelled is True
+        assert inspector.streams[('socket-1', 'watch-1')] is not previous
+    finally:
+        for task in list(inspector.streams.values()) + list(inspector.stream_readers):
+            task.cancel()
+        await asyncio.gather(
+            *list(inspector.streams.values()) + list(inspector.stream_readers),
+            return_exceptions=True,
+        )
+        inspector.streams.clear()
+        inspector.stream_readers.clear()
